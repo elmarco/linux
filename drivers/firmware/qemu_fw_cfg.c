@@ -66,7 +66,6 @@ static void fw_cfg_sel_endianness(u16 key)
 		iowrite16(key, fw_cfg_reg_ctrl);
 }
 
-#ifdef CONFIG_CRASH_CORE
 static inline bool fw_cfg_dma_enabled(void)
 {
 	return (fw_cfg_rev & FW_CFG_VERSION_DMA) && fw_cfg_reg_dma;
@@ -124,14 +123,49 @@ end:
 
 	return ret;
 }
-#endif
+
+/* with acpi & dev locks taken */
+static ssize_t fw_cfg_read_blob_dma(u16 key,
+				void *buf, loff_t pos, size_t count)
+{
+	ssize_t ret;
+
+	if (pos == 0) {
+		ret = fw_cfg_dma_transfer(buf, count, key << 16
+					| FW_CFG_DMA_CTL_SELECT
+					| FW_CFG_DMA_CTL_READ);
+	} else {
+		fw_cfg_sel_endianness(key);
+		ret = fw_cfg_dma_transfer(NULL, pos, FW_CFG_DMA_CTL_SKIP);
+		if (ret < 0)
+			return ret;
+		ret = fw_cfg_dma_transfer(buf, count,
+					FW_CFG_DMA_CTL_READ);
+	}
+
+	return ret;
+}
+
+/* with acpi & dev locks taken */
+static ssize_t fw_cfg_read_blob_io(u16 key,
+				void *buf, loff_t pos, size_t count)
+{
+	fw_cfg_sel_endianness(key);
+	while (pos-- > 0)
+		ioread8(fw_cfg_reg_data);
+	ioread8_rep(fw_cfg_reg_data, buf, count);
+	return count;
+}
 
 /* read chunk of given fw_cfg blob (caller responsible for sanity-check) */
 static ssize_t fw_cfg_read_blob(u16 key,
-				void *buf, loff_t pos, size_t count)
+				void *buf, loff_t pos, size_t count,
+				ssize_t (*readfn)(u16 key, void *buf,
+						loff_t pos, size_t count))
 {
 	u32 glk = -1U;
 	acpi_status status;
+	ssize_t ret;
 
 	/* If we have ACPI, ensure mutual exclusion against any potential
 	 * device access by the firmware, e.g. via AML methods:
@@ -145,14 +179,19 @@ static ssize_t fw_cfg_read_blob(u16 key,
 	}
 
 	mutex_lock(&fw_cfg_dev_lock);
-	fw_cfg_sel_endianness(key);
-	while (pos-- > 0)
-		ioread8(fw_cfg_reg_data);
-	ioread8_rep(fw_cfg_reg_data, buf, count);
+
+	/* fallback to IO if DMA is not available */
+	if (readfn == fw_cfg_read_blob_dma && !fw_cfg_dma_enabled()) {
+		readfn = fw_cfg_read_blob_io;
+	}
+
+	ret = readfn(key, buf, pos, count);
+
 	mutex_unlock(&fw_cfg_dev_lock);
 
 	acpi_release_global_lock(glk);
-	return count;
+
+	return ret;
 }
 
 #ifdef CONFIG_CRASH_CORE
@@ -286,7 +325,7 @@ static int fw_cfg_do_platform_probe(struct platform_device *pdev)
 
 	/* verify fw_cfg device signature */
 	if (fw_cfg_read_blob(FW_CFG_SIGNATURE, sig,
-				0, FW_CFG_SIG_SIZE) < 0 ||
+				0, FW_CFG_SIG_SIZE, fw_cfg_read_blob_io) < 0 ||
 		memcmp(sig, "QEMU", FW_CFG_SIG_SIZE) != 0) {
 		fw_cfg_io_cleanup();
 		return -ENODEV;
@@ -470,7 +509,9 @@ static ssize_t fw_cfg_sysfs_read_raw(struct file *filp, struct kobject *kobj,
 	if (count > entry->size - pos)
 		count = entry->size - pos;
 
-	return fw_cfg_read_blob(entry->select, buf, pos, count);
+	/* do not use DMA, virt_to_phys(buf) might not be ok */
+	return fw_cfg_read_blob(entry->select, buf, pos, count,
+				fw_cfg_read_blob_io);
 }
 
 static struct bin_attribute fw_cfg_sysfs_attr_raw = {
@@ -636,7 +677,7 @@ static int fw_cfg_register_dir_entries(void)
 	size_t dir_size;
 
 	ret = fw_cfg_read_blob(FW_CFG_FILE_DIR, &files_count,
-			0, sizeof(files_count));
+			0, sizeof(files_count), fw_cfg_read_blob_io);
 	if (ret < 0)
 		return ret;
 
@@ -648,7 +689,7 @@ static int fw_cfg_register_dir_entries(void)
 		return -ENOMEM;
 
 	ret = fw_cfg_read_blob(FW_CFG_FILE_DIR, dir,
-			sizeof(files_count), dir_size);
+			sizeof(files_count), dir_size, fw_cfg_read_blob_dma);
 	if (ret < 0)
 		goto end;
 
@@ -699,7 +740,8 @@ static int fw_cfg_sysfs_probe(struct platform_device *pdev)
 		goto err_probe;
 
 	/* get revision number, add matching top-level attribute */
-	err = fw_cfg_read_blob(FW_CFG_ID, &rev, 0, sizeof(rev));
+	err = fw_cfg_read_blob(FW_CFG_ID, &rev, 0, sizeof(rev),
+			fw_cfg_read_blob_io);
 	if (err < 0)
 		goto err_probe;
 
