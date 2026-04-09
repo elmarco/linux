@@ -870,6 +870,11 @@ static bool virtio_mem_contains_range(struct virtio_mem *vm, uint64_t start,
  * In CoCo (TDX, SEV-SNP) environments, hotplugged memory must be converted
  * to private/encrypted before use, and to shared/decrypted before returning
  * to the hypervisor on unplug.
+ *
+ * When VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE is negotiated, the hypervisor
+ * will not access unplugged memory and can discard private memory directly
+ * (e.g. via guest_memfd).  In that case, converting to shared/decrypted
+ * on unplug is unnecessary and can be skipped.
  */
 static int virtio_mem_coco_set_encrypted(uint64_t addr, uint64_t size)
 {
@@ -879,6 +884,18 @@ static int virtio_mem_coco_set_encrypted(uint64_t addr, uint64_t size)
 static int virtio_mem_coco_set_decrypted(uint64_t addr, uint64_t size)
 {
 	return set_memory_decrypted((unsigned long)__va(addr), PFN_DOWN(size));
+}
+
+/*
+ * Whether we can skip converting to shared/decrypted on unplug.  When
+ * UNPLUGGED_INACCESSIBLE is negotiated, the hypervisor won't access unplugged
+ * memory and can discard private memory directly (e.g. via guest_memfd),
+ * so the MapGPA conversion overhead can be avoided.
+ */
+static bool virtio_mem_coco_unplug_skip_shared(struct virtio_mem *vm)
+{
+	return virtio_has_feature(vm->vdev,
+				 VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE);
 }
 
 /*
@@ -1708,7 +1725,8 @@ static int virtio_mem_sbm_unplug_any_sb_raw(struct virtio_mem *vm,
 			sb_id--;
 		}
 
-		if (coco_shared) {
+		if (coco_shared &&
+		    !virtio_mem_coco_unplug_skip_shared(vm)) {
 			uint64_t addr = virtio_mem_mb_id_to_phys(mb_id) +
 					sb_id * vm->sbm.sb_size;
 			uint64_t size = (uint64_t)count * vm->sbm.sb_size;
@@ -2113,10 +2131,12 @@ static int virtio_mem_sbm_unplug_sb_online(struct virtio_mem *vm,
 		return rc;
 
 	/* Convert to shared/decrypted for CoCo before handing back */
-	rc = virtio_mem_coco_set_decrypted(addr, size);
-	if (rc) {
-		virtio_mem_fake_online(start_pfn, nr_pages);
-		return rc;
+	if (!virtio_mem_coco_unplug_skip_shared(vm)) {
+		rc = virtio_mem_coco_set_decrypted(addr, size);
+		if (rc) {
+			virtio_mem_fake_online(start_pfn, nr_pages);
+			return rc;
+		}
 	}
 
 	/* Try to unplug the allocated memory */
@@ -2127,7 +2147,8 @@ static int virtio_mem_sbm_unplug_sb_online(struct virtio_mem *vm,
 		 * fails, we must not fake-online shared memory -- that would
 		 * be a CoCo confidentiality breach. Leak the memory instead.
 		 */
-		if (virtio_mem_coco_set_encrypted(addr, size)) {
+		if (!virtio_mem_coco_unplug_skip_shared(vm) &&
+		    virtio_mem_coco_set_encrypted(addr, size)) {
 			dev_err(&vm->vdev->dev,
 				"CoCo set_encrypted failed, leaking memory\n");
 			return rc;
@@ -2333,12 +2354,16 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
 	/*
 	 * Convert private→shared for CoCo while direct map still exists.
 	 * Must happen before offline_and_remove tears down the mapping.
+	 * Skip when UNPLUGGED_INACCESSIBLE: hypervisor can discard private
+	 * memory directly.
 	 */
-	rc = virtio_mem_coco_set_decrypted(
-		virtio_mem_bb_id_to_phys(vm, bb_id), vm->bbm.bb_size);
-	if (rc) {
-		mutex_lock(&vm->hotplug_mutex);
-		goto rollback;
+	if (!virtio_mem_coco_unplug_skip_shared(vm)) {
+		rc = virtio_mem_coco_set_decrypted(
+			virtio_mem_bb_id_to_phys(vm, bb_id), vm->bbm.bb_size);
+		if (rc) {
+			mutex_lock(&vm->hotplug_mutex);
+			goto rollback;
+		}
 	}
 
 	rc = virtio_mem_bbm_offline_and_remove_bb(vm, bb_id);
@@ -2347,7 +2372,8 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
 		 * Convert back to private/encrypted for CoCo. If this fails,
 		 * we must not fake-online shared memory -- leak it instead.
 		 */
-		if (virtio_mem_coco_set_encrypted(
+		if (!virtio_mem_coco_unplug_skip_shared(vm) &&
+		    virtio_mem_coco_set_encrypted(
 			    virtio_mem_bb_id_to_phys(vm, bb_id),
 			    vm->bbm.bb_size)) {
 			dev_err(&vm->vdev->dev,
